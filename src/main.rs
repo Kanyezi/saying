@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use eframe::egui;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -7,14 +9,20 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc as std_mpsc;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::SampleFormat;
 
 const DISCOVERY_PORT: u16 = 42_000;
 const DISCOVERY_MAGIC: &str = "SAYING_DISCOVERY";
+const AUDIO_PORT: u16 = 43000;
 
 fn main() -> eframe::Result<()> {
 	std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
 	std::env::set_var("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe");
 	std::env::remove_var("WAYLAND_DISPLAY");
+
+	let font_path = find_first_font_file();
 
 	let options = eframe::NativeOptions {
 		renderer: eframe::Renderer::Glow,
@@ -25,15 +33,49 @@ fn main() -> eframe::Result<()> {
 	eframe::run_native(
 		"saying",
 		options,
-		Box::new(|cc| {
-			configure_fonts(&cc.egui_ctx);
+		Box::new(move |cc| {
+			configure_fonts(&cc.egui_ctx, font_path.as_deref());
 			Box::new(MyApp::new())
 		}),
 	)
 }
 
-fn configure_fonts(ctx: &egui::Context) {
-	let font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+fn find_first_font_file() -> Option<std::path::PathBuf> {
+	let candidates = [
+		std::env::current_dir().ok().map(|dir| dir.join("font")),
+		std::env::current_exe()
+			.ok()
+			.and_then(|path| path.parent().map(|parent| parent.join("font"))),
+	];
+
+	for font_dir in candidates.into_iter().flatten() {
+		let Ok(entries) = std::fs::read_dir(&font_dir) else {
+			continue;
+		};
+
+		let mut font_files: Vec<std::path::PathBuf> = entries
+			.filter_map(|entry| entry.ok().map(|entry| entry.path()))
+			.filter(|path| {
+				path.extension()
+					.and_then(|ext| ext.to_str())
+					.map(|ext| ext.eq_ignore_ascii_case("ttf"))
+					.unwrap_or(false)
+			})
+			.collect();
+		font_files.sort();
+		if let Some(first) = font_files.into_iter().next() {
+			return Some(first);
+		}
+	}
+
+	None
+}
+
+fn configure_fonts(ctx: &egui::Context, font_path: Option<&std::path::Path>) {
+	let Some(font_path) = font_path else {
+		return;
+	};
+
 	let Ok(font_bytes) = std::fs::read(font_path) else {
 		return;
 	};
@@ -41,14 +83,14 @@ fn configure_fonts(ctx: &egui::Context) {
 	let mut fonts = egui::FontDefinitions::default();
 	fonts
 		.font_data
-		.insert("noto-cjk".to_string(), egui::FontData::from_owned(font_bytes));
+		.insert("font-file".to_string(), egui::FontData::from_owned(font_bytes));
 
 	if let Some(fallbacks) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-		fallbacks.insert(0, "noto-cjk".to_string());
+		fallbacks.insert(0, "font-file".to_string());
 	}
 
 	if let Some(fallbacks) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-		fallbacks.push("noto-cjk".to_string());
+		fallbacks.push("font-file".to_string());
 	}
 
 	ctx.set_fonts(fonts);
@@ -61,6 +103,11 @@ struct MyApp {
 	peers: HashMap<String, PeerInfo>,
 	status: String,
 	last_cleanup: Instant,
+	input_devices: Vec<String>,
+	output_devices: Vec<String>,
+	selected_input: usize,
+	selected_output: usize,
+	audio_service: Option<AudioService>,
 }
 
 impl MyApp {
@@ -69,6 +116,27 @@ impl MyApp {
 		let local_id = build_local_id(&local_name);
 		let discovery = DiscoveryService::start(local_id.clone(), local_name.clone());
 
+		// enumerate audio devices
+		let host = cpal::default_host();
+		let input_devices: Vec<String> = host
+			.input_devices()
+			.ok()
+			.map(|devices| {
+				devices
+					.filter_map(|device| device.name().ok())
+					.collect::<Vec<String>>()
+			})
+			.unwrap_or_default();
+		let output_devices: Vec<String> = host
+			.output_devices()
+			.ok()
+			.map(|devices| {
+				devices
+					.filter_map(|device| device.name().ok())
+					.collect::<Vec<String>>()
+			})
+			.unwrap_or_default();
+
 		Self {
 			local_name,
 			local_id,
@@ -76,6 +144,11 @@ impl MyApp {
 			peers: HashMap::new(),
 			status: "正在广播并扫描同一局域网的用户...".to_string(),
 			last_cleanup: Instant::now(),
+			input_devices,
+			output_devices,
+			selected_input: 0,
+			selected_output: 0,
+			audio_service: None,
 		}
 	}
 
@@ -121,6 +194,61 @@ impl eframe::App for MyApp {
 		});
 
 		egui::CentralPanel::default().show(ctx, |ui| {
+			ui.group(|ui| {
+				ui.horizontal(|ui| {
+					ui.label("输入设备:");
+					egui::ComboBox::from_id_source("input_devices")
+						.selected_text(
+							self.input_devices
+								.get(self.selected_input)
+								.cloned()
+								.unwrap_or_else(|| "(none)".to_string()),
+						)
+						.show_ui(ui, |ui| {
+							for (i, name) in self.input_devices.iter().enumerate() {
+								ui.selectable_value(&mut self.selected_input, i, name);
+							}
+						});
+
+					ui.label("输出设备:");
+					egui::ComboBox::from_id_source("output_devices")
+						.selected_text(
+							self.output_devices
+								.get(self.selected_output)
+								.cloned()
+								.unwrap_or_else(|| "(none)".to_string()),
+						)
+						.show_ui(ui, |ui| {
+							for (i, name) in self.output_devices.iter().enumerate() {
+								ui.selectable_value(&mut self.selected_output, i, name);
+							}
+						});
+
+					if ui.button("开始广播音频").clicked() {
+						if self.audio_service.is_none() {
+							let input_name = self
+								.input_devices
+								.get(self.selected_input)
+								.cloned();
+							let output_name = self
+								.output_devices
+								.get(self.selected_output)
+								.cloned();
+							let svc = AudioService::start(input_name, output_name);
+							self.status = svc.status_message.clone();
+							self.audio_service = Some(svc);
+						}
+					}
+
+					if ui.button("停止音频").clicked() {
+						if let Some(svc) = self.audio_service.take() {
+							svc.stop();
+							self.status = "音频已停止".to_string();
+						}
+					}
+				});
+			});
+
 			ui.horizontal(|ui| {
 				ui.label(format!("本机 ID: {}", self.local_id));
 				ui.separator();
@@ -165,6 +293,132 @@ impl eframe::App for MyApp {
 
 		ctx.request_repaint_after(Duration::from_millis(200));
 	}
+}
+
+struct AudioService {
+	stop_flag: Arc<AtomicBool>,
+	input_stream: Option<cpal::Stream>,
+	status_message: String,
+}
+
+impl AudioService {
+	fn start(input_name: Option<String>, output_name: Option<String>) -> Self {
+		let stop_flag = Arc::new(AtomicBool::new(true));
+		let (snd_tx, snd_rx) = std_mpsc::sync_channel::<Vec<u8>>(64);
+		let thread_stop = Arc::clone(&stop_flag);
+
+		thread::spawn(move || {
+			let socket = match std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+				Ok(socket) => socket,
+				Err(error) => {
+					eprintln!("audio udp bind failed: {error}");
+					return;
+				}
+			};
+
+			let _ = socket.set_broadcast(true);
+			let target = ("255.255.255.255", AUDIO_PORT);
+
+			while thread_stop.load(Ordering::Relaxed) {
+				match snd_rx.recv_timeout(Duration::from_millis(200)) {
+					Ok(chunk) => {
+						let _ = socket.send_to(&chunk, target);
+					}
+					Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+					Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+				}
+			}
+		});
+
+		let host = cpal::default_host();
+		let input_stream = resolve_input_device(&host, input_name.as_deref())
+			.and_then(|device| build_input_stream(&device, snd_tx));
+
+		let _ = output_name;
+
+		AudioService {
+			stop_flag,
+			input_stream,
+			status_message: "音频服务已启动，正在广播输入设备采集到的声音".to_string(),
+		}
+	}
+
+	fn stop(self) {
+		self.stop_flag.store(false, Ordering::Relaxed);
+		let _ = self.input_stream;
+	}
+}
+
+fn resolve_input_device(host: &cpal::Host, input_name: Option<&str>) -> Option<cpal::Device> {
+	if let Some(target_name) = input_name {
+		if let Ok(devices) = host.input_devices() {
+			if let Some(device) = devices
+				.into_iter()
+				.find(|device| device.name().ok().as_deref() == Some(target_name))
+			{
+				return Some(device);
+			}
+		}
+	}
+
+	host.default_input_device().or_else(|| {
+		host.input_devices().ok()?.into_iter().next()
+	})
+}
+
+fn build_input_stream(device: &cpal::Device, sender: std_mpsc::SyncSender<Vec<u8>>) -> Option<cpal::Stream> {
+	let config = device.default_input_config().ok()?;
+	let channels = config.channels() as usize;
+	let err_fn = |error| eprintln!("input stream error: {error}");
+
+	let stream = match config.sample_format() {
+		SampleFormat::F32 => device.build_input_stream(
+			&config.clone().into(),
+			move |data: &[f32], _| {
+				let mut buf = Vec::with_capacity(data.len() * 2);
+				for frame in data.chunks(channels) {
+					let sample = frame[0].clamp(-1.0, 1.0);
+					let value = (sample * i16::MAX as f32) as i16;
+					buf.extend_from_slice(&value.to_le_bytes());
+				}
+				let _ = sender.try_send(buf);
+			},
+			err_fn,
+			None,
+		),
+		SampleFormat::I16 => device.build_input_stream(
+			&config.clone().into(),
+			move |data: &[i16], _| {
+				let mut buf = Vec::with_capacity(data.len() * 2);
+				for frame in data.chunks(channels) {
+					buf.extend_from_slice(&frame[0].to_le_bytes());
+				}
+				let _ = sender.try_send(buf);
+			},
+			err_fn,
+			None,
+		),
+		SampleFormat::U16 => device.build_input_stream(
+			&config.clone().into(),
+			move |data: &[u16], _| {
+				let mut buf = Vec::with_capacity(data.len() * 2);
+				for frame in data.chunks(channels) {
+					let value = (frame[0] as i32 - 32768) as i16;
+					buf.extend_from_slice(&value.to_le_bytes());
+				}
+				let _ = sender.try_send(buf);
+			},
+			err_fn,
+			None,
+		),
+		_ => return None,
+	};
+
+	let stream = stream.ok()?;
+	if stream.play().is_err() {
+		return None;
+	}
+	Some(stream)
 }
 
 impl Drop for MyApp {
