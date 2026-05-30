@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+    <style>
+        *{
+            padding: 0;
+            margin: 0;
+            list-style: none;
+        }
+        .users{
+            display: flex;
+            justify-content: flex-start;
+        }
+        .user{
+            width: 200px;
+            border: 1px solid #ccc;
+            margin: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="main">
+        <div class="dq">
+            <p>本机名称:wst</p>
+            <p>本机 IP: 10.72.43.137</p>
+        </div>
+        <div class="shebei">
+            <p>输入设备:</p>
+            <p>输出设备:</p>
+            <button>开始广播</button>
+        </div>
+        <!-- 加入的频段列表 -->
+        <ul class="jiaru">
+            <li class="pinduan">
+                <p>音频频段: 12</p>
+                <div class="users">
+                    <div class="user">
+                        <p>wst</p>
+                        <p>ip: 10.72.43.137</p>
+                        <p>在线 | 0ms前</p>
+                    </div>
+                    <div class="user">
+                        <p>用户 2</p>
+                        <p>ip: 10.72.43.131</p>
+                        <p>在线 | 100ms前</p>
+                    </div>
+                </div>
+            </li>
+        </ul>
+        <!-- 识别到的频段列表 -->
+        <ul class="pinduans">
+            <p>识别到的频段:</p>
+            <li class="pinduan">
+                <p>音频频段: 12</p>
+                <div class="users">
+                    <div class="user">
+                        <p>用户 1</p>
+                        <p>ip: 10.72.43.138</p>
+                        <p>在线 | 100ms前</p>
+                    </div>
+                    <div class="user">
+                        <p>用户 2</p>
+                        <p>ip: 10.72.43.131</p>
+                        <p>在线 | 100ms前</p>
+                    </div>
+                </div>
+            </li>
+            <li class="pinduan">
+                <p>音频频段: 12</p>
+                <div class="users">
+                    <div class="user">
+                        <p>用户 1</p>
+                        <p>ip: 10.72.43.138</p>
+                        <p>在线 | 100ms前</p>
+                    </div>
+                </div>
+            </li>
+        </ul>
+    </div>
+</body>
+</html>
