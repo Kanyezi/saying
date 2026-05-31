@@ -19,6 +19,40 @@ const DISCOVERY_MAGIC: &str = "SAYING_DISCOVERY";
 const BAND_DISCOVERY_MAGIC: &str = "SAYING_BAND_DISCOVERY";
 const AUDIO_MAGIC: &str = "SAYING_AUDIO";
 const DEFAULT_BAND_PORT: u16 = 42_000;
+const LOCAL_SPEAKING_THRESHOLD: f32 = 0.12;
+const MIC_BROADCAST_START_THRESHOLD: f32 = 0.16;
+const MIC_BROADCAST_STOP_THRESHOLD: f32 = 0.08;
+const MIC_BROADCAST_HOLD_DURATION: Duration = Duration::from_millis(180);
+
+#[derive(Clone, Copy)]
+struct MicGateConfig {
+	start_threshold: f32,
+	stop_threshold: f32,
+	hold_ms: u32,
+}
+
+impl Default for MicGateConfig {
+	fn default() -> Self {
+		Self {
+			start_threshold: MIC_BROADCAST_START_THRESHOLD,
+			stop_threshold: MIC_BROADCAST_STOP_THRESHOLD,
+			hold_ms: MIC_BROADCAST_HOLD_DURATION.as_millis() as u32,
+		}
+	}
+}
+
+impl MicGateConfig {
+	fn normalized(mut self) -> Self {
+		self.start_threshold = self.start_threshold.clamp(0.0, 1.0);
+		self.stop_threshold = self.stop_threshold.clamp(0.0, self.start_threshold);
+		self.hold_ms = self.hold_ms.min(2_000);
+		self
+	}
+
+	fn hold_duration(&self) -> Duration {
+		Duration::from_millis(self.hold_ms as u64)
+	}
+}
 
 fn main() -> eframe::Result<()> {
 	std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
@@ -217,6 +251,7 @@ impl MyApp {
 		band_mic_defaults.insert(DEFAULT_BAND_PORT, true);
 		let available_collapsed = HashSet::new();
 		let band_mic_enabled = Arc::new(Mutex::new(band_mic_defaults));
+		let mic_gate_config = Arc::new(Mutex::new(MicGateConfig::default()));
 
 		let host = cpal::default_host();
 		let input_devices: Vec<String> = host
@@ -270,6 +305,7 @@ impl MyApp {
 				preferences.output_device.clone(),
 				joined_bands.clone(),
 				Arc::clone(&band_mic_enabled),
+				Arc::clone(&mic_gate_config),
 			)),
 			mic_level: 0.0,
 			speaker_level: 0.0,
@@ -406,6 +442,15 @@ impl MyApp {
 			.and_then(|states| states.get(&band).copied())
 			.unwrap_or(true)
 	}
+
+	fn local_is_speaking_on_band(&self, band: u16) -> bool {
+		self.audio_service
+			.as_ref()
+			.map(|service| service.is_broadcasting())
+			.unwrap_or(false)
+			&& self.is_band_mic_enabled(band)
+			&& self.mic_level > LOCAL_SPEAKING_THRESHOLD
+	}
 }
 
 impl eframe::App for MyApp {
@@ -508,6 +553,26 @@ impl eframe::App for MyApp {
 						}
 					}
 
+					let loopback_enabled = self
+						.audio_service
+						.as_ref()
+						.map(|service| service.is_loopback_enabled())
+						.unwrap_or(false);
+					if ui
+						.button(if loopback_enabled { "声音回环: 开" } else { "声音回环: 关" })
+						.clicked()
+					{
+						if let Some(service) = self.audio_service.as_mut() {
+							let next = !loopback_enabled;
+							service.set_loopback_enabled(next);
+							self.status = if next {
+								"声音回环已开启".to_string()
+							} else {
+								"声音回环已关闭".to_string()
+							};
+						}
+					}
+
 					if ui
 						.add_enabled(broadcasting, egui::Button::new("停止广播音频"))
 						.clicked()
@@ -516,6 +581,42 @@ impl eframe::App for MyApp {
 							service.stop_broadcasting();
 							self.status = "音频广播已停止，接收仍保持开启".to_string();
 						}
+					}
+
+					ui.add_space(8.0);
+					ui.separator();
+					ui.label("麦克风门限");
+					if let Some(service) = self.audio_service.as_ref() {
+						let mut gate_config = service.mic_gate_config();
+						let mut changed = false;
+						changed |= ui
+							.add(
+								egui::Slider::new(&mut gate_config.start_threshold, 0.05..=0.30)
+									.text("起播阈值")
+							)
+							.changed();
+						changed |= ui
+							.add(
+								egui::Slider::new(&mut gate_config.stop_threshold, 0.01..=0.25)
+									.text("停播阈值")
+							)
+							.changed();
+						changed |= ui
+							.add(
+								egui::Slider::new(&mut gate_config.hold_ms, 0..=500)
+									.text("保持时间(ms)")
+							)
+							.changed();
+						gate_config = gate_config.normalized();
+						if changed {
+							service.set_mic_gate_config(gate_config);
+						}
+						ui.small(format!(
+							"当前: 起播 {:.2}, 停播 {:.2}, 保持 {}ms",
+							gate_config.start_threshold,
+							gate_config.stop_threshold,
+							gate_config.hold_ms
+						));
 					}
 				});
 
@@ -550,12 +651,12 @@ impl eframe::App for MyApp {
 			ui.add_space(8.0);
 
 			ui.label("加入的频段列表");
-			ui.add_space(6.0);
+			ui.add_space(10.0);
 			egui::ScrollArea::vertical().show(ui, |ui| {
 				for band in self.joined_bands.clone() {
 					ui.group(|ui| {
 						ui.label(format!("音频频段: {}", band));
-						ui.add_space(6.0);
+						ui.add_space(10.0);
 						ui.horizontal(|ui| {
 							let mic_label = if self.is_band_mic_enabled(band) {
 								"禁用麦克风"
@@ -569,31 +670,51 @@ impl eframe::App for MyApp {
 								self.leave_band(band);
 							}
 						});
+						ui.add_space(10.0);
 						ui.horizontal_wrapped(|ui| {
-							let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
-							let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 140, 255)));
-							ui.allocate_ui_at_rect(rect, |ui| {
-								frame.show(ui, |ui| {
-									ui.vertical_centered(|ui| {
+							// local card (auto-size, inner padding 5px)
+							let frame = egui::Frame::none()
+								.stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)))
+								;
+
+							// fixed-size local card
+							let size = egui::vec2(100.0, 45.0);
+							let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+							let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center));
+							frame.show(&mut child, |ui| {
+								ui.vertical_centered(|ui| {
+									ui.horizontal(|ui| {
+										draw_status_dot(ui, self.local_is_speaking_on_band(band));
 										ui.label(format!("{}（本机）", self.local_name));
-										ui.small(format!("ip: {}", self.local_ip));
-										ui.small("在线 | 本机");
 									});
+									ui.small(format!("ip: {}", self.local_ip));
 								});
 							});
 
+							// peers
 							for peer in self.peers.values().filter(|peer| peer.ip != self.local_ip && peer.bands.contains(&band)) {
-								let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
-								let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)));
-								ui.allocate_ui_at_rect(rect, |ui| {
-									frame.show(ui, |ui| {
-										ui.vertical_centered(|ui| {
+								let speaking = self
+									.audio_service
+									.as_ref()
+									.map(|service| service.peer_is_speaking(band, &peer.ip))
+									.unwrap_or(false);
+								let frame = egui::Frame::none()
+									.stroke(egui::Stroke::new(1.0, if speaking { egui::Color32::from_rgb(46, 204, 113) } else { egui::Color32::from_gray(200) }))
+									;
+
+								// fixed-size peer card
+								let size = egui::vec2(100.0, 45.0);
+								let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+								let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center));
+								frame.show(&mut child, |ui| {
+									ui.vertical_centered(|ui| {
+										ui.horizontal(|ui| {
+											draw_status_dot(ui, speaking);
 											ui.label(&peer.name);
-											ui.small(format!("ip: {}", peer.ip));
-											let age = peer.last_seen.elapsed();
-											let indicator = if age <= Duration::from_secs(2) { "在线" } else { "刚发现" };
-											ui.small(format!("{} | {} 前", indicator, format_age(age)));
 										});
+										ui.small(format!("ip: {}", peer.ip));
+										let age = peer.last_seen.elapsed();
+										ui.small(format!("{} 前", format_age(age)));
 									});
 								});
 							}
@@ -605,7 +726,7 @@ impl eframe::App for MyApp {
 
 			ui.add_space(10.0);
 			ui.label("识别到的频段:");
-			ui.add_space(6.0);
+			ui.add_space(10.0);
 			let mut available_bands: Vec<u16> = self.available_bands.keys().copied().collect();
 			available_bands.sort_unstable();
 			for band in available_bands {
@@ -630,27 +751,34 @@ impl eframe::App for MyApp {
 					});
 
 					if !collapsed {
-						ui.add_space(6.0);
+						ui.add_space(10.0);
 						ui.horizontal_wrapped(|ui| {
 							for peer in self.peers.values().filter(|p| p.ip != self.local_ip && p.bands.contains(&band)) {
-								let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
-								let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)));
-								ui.allocate_ui_at_rect(rect, |ui| {
-									frame.show(ui, |ui| {
-										ui.vertical_centered(|ui| {
+								let speaking = self
+									.audio_service
+									.as_ref()
+									.map(|service| service.peer_is_speaking(band, &peer.ip))
+									.unwrap_or(false);
+								let frame = egui::Frame::none()
+									.stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)))
+									;
+
+								frame.show(ui, |ui| {
+									ui.vertical_centered(|ui| {
+										ui.horizontal(|ui| {
+											draw_status_dot(ui, speaking);
 											ui.label(&peer.name);
-											ui.small(format!("ip: {}", peer.ip));
-											let age = peer.last_seen.elapsed();
-											let indicator = if age <= Duration::from_secs(2) { "在线" } else { "刚发现" };
-											ui.small(format!("{} | {} 前", indicator, format_age(age)));
 										});
+										ui.small(format!("ip: {}", peer.ip));
+										let age = peer.last_seen.elapsed();
+										ui.small(format!("{} 前", format_age(age)));
 									});
 								});
 							}
 						});
 					}
 				});
-				ui.add_space(8.0);
+				ui.add_space(10.0);
 			}
 
 			if self.available_bands.is_empty() {
@@ -676,6 +804,11 @@ struct AudioService {
 	metrics: Arc<AudioMetrics>,
 	local_ip: String,
 	joined_bands: Arc<Mutex<Vec<u16>>>,
+	speaking_map: Arc<Mutex<HashMap<(u16, String), Instant>>>,
+	playback_queue: Arc<Mutex<VecDeque<i16>>>,
+	output_rate: Option<u32>,
+	loopback_enabled: Arc<AtomicBool>,
+	mic_gate_config: Arc<Mutex<MicGateConfig>>,
 	_band_mic_enabled: Arc<Mutex<HashMap<u16, bool>>>,
 }
 
@@ -685,14 +818,19 @@ impl AudioService {
 		output_name: Option<String>,
 		bands: Vec<u16>,
 		band_mic_enabled: Arc<Mutex<HashMap<u16, bool>>>,
+		mic_gate_config: Arc<Mutex<MicGateConfig>>,
 	) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(true));
 		let metrics = Arc::new(AudioMetrics::default());
 		let playback_queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+		let loopback_enabled = Arc::new(AtomicBool::new(false));
 		let (snd_tx, snd_rx) = std_mpsc::sync_channel::<Vec<u8>>(64);
 		let joined_bands = Arc::new(Mutex::new(bands));
 		let bands_for_send = Arc::clone(&joined_bands);
 		let band_mic_enabled_for_send = Arc::clone(&band_mic_enabled);
+
+		let speaking_map = Arc::new(Mutex::new(HashMap::new()));
+
 
 		let sender_stop = Arc::clone(&stop_flag);
 		thread::spawn(move || {
@@ -743,6 +881,7 @@ impl AudioService {
 		let receiver_queue = Arc::clone(&playback_queue);
 		let receiver_metrics = Arc::clone(&metrics);
 		let bands_for_recv = Arc::clone(&joined_bands);
+		let speaking_map_for_recv = Arc::clone(&speaking_map);
 		thread::spawn(move || {
 			let mut buffer = [0_u8; 4096];
 			let mut current_bands: Vec<u16> = Vec::new();
@@ -760,7 +899,8 @@ impl AudioService {
 					continue;
 				}
 
-				for socket in &sockets {
+				for (i, socket) in sockets.iter().enumerate() {
+					let band = current_bands.get(i).cloned().unwrap_or(DEFAULT_BAND_PORT);
 					match socket.recv_from(&mut buffer) {
 						Ok((length, addr)) => {
 							if addr.ip().to_string() == local_ip_for_recv {
@@ -779,6 +919,10 @@ impl AudioService {
 									_ => samples,
 								};
 
+								// record that we heard audio from this source on this band
+								if let Ok(mut map) = speaking_map_for_recv.lock() {
+									map.insert((band, source_ip.clone()), Instant::now());
+								}
 								if let Ok(mut queue) = receiver_queue.lock() {
 									queue.extend(playback_samples);
 								}
@@ -803,6 +947,11 @@ impl AudioService {
 			metrics,
 			local_ip,
 			joined_bands,
+			speaking_map,
+			playback_queue,
+			output_rate,
+			loopback_enabled,
+			mic_gate_config,
 			_band_mic_enabled: band_mic_enabled,
 		}
 	}
@@ -820,6 +969,10 @@ impl AudioService {
 					self.sender_tx.clone(),
 					Arc::clone(&self.metrics),
 					self.local_ip.clone(),
+					Arc::clone(&self.loopback_enabled),
+					self.output_rate,
+					Arc::clone(&self.playback_queue),
+					Arc::clone(&self.mic_gate_config),
 				)
 			})
 		});
@@ -845,6 +998,39 @@ impl AudioService {
 
 	fn speaker_level(&self) -> f32 {
 		self.metrics.speaker_level()
+	}
+
+	fn set_loopback_enabled(&self, enabled: bool) {
+		self.loopback_enabled.store(enabled, Ordering::Relaxed);
+	}
+
+	fn is_loopback_enabled(&self) -> bool {
+		self.loopback_enabled.load(Ordering::Relaxed)
+	}
+
+	fn mic_gate_config(&self) -> MicGateConfig {
+		self.mic_gate_config
+			.lock()
+			.map(|config| *config)
+			.unwrap_or_default()
+	}
+
+	fn set_mic_gate_config(&self, config: MicGateConfig) {
+		if let Ok(mut current) = self.mic_gate_config.lock() {
+			*current = config.normalized();
+		}
+	}
+
+	// Determine whether a remote peer is currently speaking on a band.
+	// Returns true if we've heard audio from (band, peer_ip) within the
+	// last 500ms to avoid toggling during short gaps in speech.
+	fn peer_is_speaking(&self, band: u16, peer_ip: &str) -> bool {
+		if let Ok(map) = self.speaking_map.lock() {
+			if let Some(ts) = map.get(&(band, peer_ip.to_string())) {
+				return ts.elapsed() <= Duration::from_millis(500);
+			}
+		}
+		false
 	}
 }
 
@@ -915,52 +1101,169 @@ fn build_input_stream(
 	sender: std_mpsc::SyncSender<Vec<u8>>,
 	metrics: Arc<AudioMetrics>,
 	local_id: String,
+	loopback_enabled: Arc<AtomicBool>,
+	output_rate: Option<u32>,
+	playback_queue: Arc<Mutex<VecDeque<i16>>>,
+	mic_gate_config: Arc<Mutex<MicGateConfig>>,
 ) -> Option<cpal::Stream> {
 	let config = device.default_input_config().ok()?;
 	let sample_rate = config.sample_rate().0;
 	let channels = config.channels() as usize;
 	let err_fn = |error| eprintln!("input stream error: {error}");
+	let broadcast_active = Arc::new(AtomicBool::new(false));
+	let last_voice = Arc::new(Mutex::new(Instant::now()));
 
 	let stream = match config.sample_format() {
 		SampleFormat::F32 => device.build_input_stream(
 			&config.clone().into(),
-			move |data: &[f32], _| {
+			{
+				let sender = sender.clone();
+				let metrics = Arc::clone(&metrics);
+				let local_id = local_id.clone();
+				let loopback_enabled = Arc::clone(&loopback_enabled);
+				let playback_queue = Arc::clone(&playback_queue);
+				let broadcast_active = Arc::clone(&broadcast_active);
+				let last_voice = Arc::clone(&last_voice);
+				let mic_gate_config = Arc::clone(&mic_gate_config);
+				move |data: &[f32], _| {
 				let mut samples = Vec::with_capacity(data.len() / channels + 1);
 				for frame in data.chunks(channels) {
 					let sample = frame[0].clamp(-1.0, 1.0);
 					samples.push((sample * i16::MAX as f32) as i16);
 				}
-				metrics.set_mic_level(audio_level_i16(&samples));
-				let packet = build_audio_packet(&local_id, sample_rate, &samples);
-				let _ = sender.try_send(packet);
+				let level = audio_level_i16(&samples);
+				metrics.set_mic_level(level);
+				if let Ok(config) = mic_gate_config.lock() {
+					if should_broadcast_input(
+						level,
+						&broadcast_active,
+						&last_voice,
+						config.start_threshold,
+						config.stop_threshold,
+						config.hold_duration(),
+					) {
+						broadcast_active.store(true, Ordering::Relaxed);
+						let packet = build_audio_packet(&local_id, sample_rate, &samples);
+						let _ = sender.try_send(packet);
+						if loopback_enabled.load(Ordering::Relaxed) {
+							metrics.set_speaker_level(level);
+							let loopback_samples = match output_rate {
+								Some(target_rate) if target_rate != sample_rate => {
+									resample_i16_mono(&samples, sample_rate, target_rate)
+								}
+								_ => samples.clone(),
+							};
+							if let Ok(mut queue) = playback_queue.lock() {
+								queue.extend(loopback_samples);
+							}
+						}
+					} else {
+						broadcast_active.store(false, Ordering::Relaxed);
+					}
+				}
+			}
 			},
 			err_fn,
 			None,
 		),
 		SampleFormat::I16 => device.build_input_stream(
 			&config.clone().into(),
-			move |data: &[i16], _| {
+			{
+				let sender = sender.clone();
+				let metrics = Arc::clone(&metrics);
+				let local_id = local_id.clone();
+				let loopback_enabled = Arc::clone(&loopback_enabled);
+				let playback_queue = Arc::clone(&playback_queue);
+				let broadcast_active = Arc::clone(&broadcast_active);
+				let last_voice = Arc::clone(&last_voice);
+				let mic_gate_config = Arc::clone(&mic_gate_config);
+				move |data: &[i16], _| {
 				let mut samples = Vec::with_capacity(data.len() / channels + 1);
 				for frame in data.chunks(channels) {
 					samples.push(frame[0]);
 				}
-				metrics.set_mic_level(audio_level_i16(&samples));
-				let packet = build_audio_packet(&local_id, sample_rate, &samples);
-				let _ = sender.try_send(packet);
+				let level = audio_level_i16(&samples);
+				metrics.set_mic_level(level);
+				if let Ok(config) = mic_gate_config.lock() {
+					if should_broadcast_input(
+						level,
+						&broadcast_active,
+						&last_voice,
+						config.start_threshold,
+						config.stop_threshold,
+						config.hold_duration(),
+					) {
+						broadcast_active.store(true, Ordering::Relaxed);
+						let packet = build_audio_packet(&local_id, sample_rate, &samples);
+						let _ = sender.try_send(packet);
+						if loopback_enabled.load(Ordering::Relaxed) {
+							metrics.set_speaker_level(level);
+							let loopback_samples = match output_rate {
+								Some(target_rate) if target_rate != sample_rate => {
+									resample_i16_mono(&samples, sample_rate, target_rate)
+								}
+								_ => samples.clone(),
+							};
+							if let Ok(mut queue) = playback_queue.lock() {
+								queue.extend(loopback_samples);
+							}
+						}
+					} else {
+						broadcast_active.store(false, Ordering::Relaxed);
+					}
+				}
+			}
 			},
 			err_fn,
 			None,
 		),
 		SampleFormat::U16 => device.build_input_stream(
 			&config.clone().into(),
-			move |data: &[u16], _| {
+			{
+				let sender = sender.clone();
+				let metrics = Arc::clone(&metrics);
+				let local_id = local_id.clone();
+				let loopback_enabled = Arc::clone(&loopback_enabled);
+				let playback_queue = Arc::clone(&playback_queue);
+				let broadcast_active = Arc::clone(&broadcast_active);
+				let last_voice = Arc::clone(&last_voice);
+				let mic_gate_config = Arc::clone(&mic_gate_config);
+				move |data: &[u16], _| {
 				let mut samples = Vec::with_capacity(data.len() / channels + 1);
 				for frame in data.chunks(channels) {
 					samples.push((frame[0] as i32 - 32768) as i16);
 				}
-				metrics.set_mic_level(audio_level_i16(&samples));
-				let packet = build_audio_packet(&local_id, sample_rate, &samples);
-				let _ = sender.try_send(packet);
+				let level = audio_level_i16(&samples);
+				metrics.set_mic_level(level);
+				if let Ok(config) = mic_gate_config.lock() {
+					if should_broadcast_input(
+						level,
+						&broadcast_active,
+						&last_voice,
+						config.start_threshold,
+						config.stop_threshold,
+						config.hold_duration(),
+					) {
+						broadcast_active.store(true, Ordering::Relaxed);
+						let packet = build_audio_packet(&local_id, sample_rate, &samples);
+						let _ = sender.try_send(packet);
+						if loopback_enabled.load(Ordering::Relaxed) {
+							metrics.set_speaker_level(level);
+							let loopback_samples = match output_rate {
+								Some(target_rate) if target_rate != sample_rate => {
+									resample_i16_mono(&samples, sample_rate, target_rate)
+								}
+								_ => samples.clone(),
+							};
+							if let Ok(mut queue) = playback_queue.lock() {
+								queue.extend(loopback_samples);
+							}
+						}
+					} else {
+						broadcast_active.store(false, Ordering::Relaxed);
+					}
+				}
+			}
 			},
 			err_fn,
 			None,
@@ -1113,6 +1416,42 @@ fn audio_level_i16(samples: &[i16]) -> f32 {
 		.map(|sample| ((*sample as i32).unsigned_abs() as f32) / i16::MAX as f32)
 		.fold(0.0f32, f32::max);
 	peak.clamp(0.0, 1.0)
+}
+
+fn should_broadcast_input(
+	level: f32,
+	broadcast_active: &Arc<AtomicBool>,
+	last_voice: &Arc<Mutex<Instant>>,
+	start_threshold: f32,
+	stop_threshold: f32,
+	hold_duration: Duration,
+) -> bool {
+	let active = broadcast_active.load(Ordering::Relaxed);
+	if level >= start_threshold {
+		if let Ok(mut last) = last_voice.lock() {
+			*last = Instant::now();
+		}
+		broadcast_active.store(true, Ordering::Relaxed);
+		return true;
+	}
+
+	if active {
+		if level >= stop_threshold {
+			if let Ok(mut last) = last_voice.lock() {
+				*last = Instant::now();
+			}
+			return true;
+		}
+
+		if let Ok(last) = last_voice.lock() {
+			if last.elapsed() <= hold_duration {
+				return true;
+			}
+		}
+	}
+
+	broadcast_active.store(false, Ordering::Relaxed);
+	false
 }
 
 fn resample_i16_mono(samples: &[i16], input_rate: u32, output_rate: u32) -> Vec<i16> {
@@ -1375,6 +1714,19 @@ fn normalize_display_name(value: String) -> Option<String> {
 		None
 	} else {
 		Some(trimmed.to_string())
+	}
+}
+
+fn draw_status_dot(ui: &mut egui::Ui, active: bool) {
+	let size = egui::vec2(18.0, 18.0);
+	let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+	let painter = ui.painter_at(rect);
+	let center = rect.center();
+
+	if active {
+		painter.circle_filled(center, 3.5, egui::Color32::from_rgb(46, 204, 113));
+	} else {
+		painter.circle_filled(center, 3.5, egui::Color32::from_gray(120));
 	}
 }
 
