@@ -216,6 +216,7 @@ impl MyApp {
 		let mut band_mic_defaults = HashMap::new();
 		band_mic_defaults.insert(DEFAULT_BAND_PORT, true);
 		let available_collapsed = HashSet::new();
+		let band_mic_enabled = Arc::new(Mutex::new(band_mic_defaults));
 
 		let host = cpal::default_host();
 		let input_devices: Vec<String> = host
@@ -250,7 +251,7 @@ impl MyApp {
 
 		Self {
 			local_name,
-			local_ip,
+			local_ip: local_ip.clone(),
 			discovery,
 			peers: HashMap::new(),
 			status: "正在广播并扫描同一局域网的用户...".to_string(),
@@ -259,12 +260,17 @@ impl MyApp {
 			output_devices,
 			selected_input,
 			selected_output,
-			joined_bands,
+			joined_bands: joined_bands.clone(),
 			available_bands: HashMap::new(),
-			band_mic_enabled: Arc::new(Mutex::new(band_mic_defaults)),
+			band_mic_enabled: Arc::clone(&band_mic_enabled),
 			available_collapsed,
 			new_band_text: String::new(),
-			audio_service: None,
+			audio_service: Some(AudioService::new(
+				local_ip.clone(),
+				preferences.output_device.clone(),
+				joined_bands.clone(),
+				Arc::clone(&band_mic_enabled),
+			)),
 			mic_level: 0.0,
 			speaker_level: 0.0,
 		}
@@ -275,14 +281,16 @@ impl MyApp {
 			match event {
 					NetEvent::PeerSeen { ip, name } => {
 						if let Some(existing) = self.peers.get_mut(&ip) {
-							existing.name = name;
+							if let Some(display_name) = normalize_display_name(name) {
+								existing.name = display_name;
+							}
 							existing.last_seen = Instant::now();
 						} else {
 							self.peers.insert(
 								ip.clone(),
 								PeerInfo {
 									ip,
-									name,
+									name: normalize_display_name(name).unwrap_or_else(|| "未命名用户".to_string()),
 									bands: Vec::new(),
 									last_seen: Instant::now(),
 								},
@@ -290,15 +298,23 @@ impl MyApp {
 						}
 				}
 				NetEvent::BandSeen { ip, name, bands } => {
-					self.peers.insert(
-						ip.clone(),
-						PeerInfo {
-							ip: ip.clone(),
-							name,
-							bands: bands.clone(),
-							last_seen: Instant::now(),
-						},
-					);
+					if let Some(existing) = self.peers.get_mut(&ip) {
+						if let Some(display_name) = normalize_display_name(name) {
+							existing.name = display_name;
+						}
+						existing.bands = bands.clone();
+						existing.last_seen = Instant::now();
+					} else {
+						self.peers.insert(
+							ip.clone(),
+							PeerInfo {
+								ip: ip.clone(),
+								name: normalize_display_name(name).unwrap_or_else(|| "未命名用户".to_string()),
+								bands: bands.clone(),
+								last_seen: Instant::now(),
+							},
+						);
+					}
 
 					for band in bands {
 						if !self.joined_bands.contains(&band) {
@@ -475,26 +491,30 @@ impl eframe::App for MyApp {
 						);
 					}
 
-					if ui.button("开始广播音频").clicked() {
-						if self.audio_service.is_none() {
+					let broadcasting = self
+						.audio_service
+						.as_ref()
+						.map(|service| service.is_broadcasting())
+						.unwrap_or(false);
+
+					if ui
+						.button(if broadcasting { "重启广播音频" } else { "开始广播音频" })
+						.clicked()
+					{
+						if let Some(service) = self.audio_service.as_mut() {
 							let input_name = self.input_devices.get(self.selected_input).cloned();
-							let output_name = self.output_devices.get(self.selected_output).cloned();
-							let svc = AudioService::start(
-								self.local_ip.clone(),
-								input_name,
-								output_name,
-								self.joined_bands.clone(),
-								Arc::clone(&self.band_mic_enabled),
-							);
-							self.status = svc.status_message.clone();
-							self.audio_service = Some(svc);
+							service.start_broadcasting(input_name);
+							self.status = "音频广播已开始，接收保持开启".to_string();
 						}
 					}
 
-					if ui.button("停止音频").clicked() {
-						if let Some(svc) = self.audio_service.take() {
-							svc.stop();
-							self.status = "音频已停止".to_string();
+					if ui
+						.add_enabled(broadcasting, egui::Button::new("停止广播音频"))
+						.clicked()
+					{
+						if let Some(service) = self.audio_service.as_mut() {
+							service.stop_broadcasting();
+							self.status = "音频广播已停止，接收仍保持开启".to_string();
 						}
 					}
 				});
@@ -524,7 +544,7 @@ impl eframe::App for MyApp {
 			ui.horizontal(|ui| {
 				ui.label(format!("本机 IP: {}", self.local_ip));
 				ui.separator();
-				ui.label(format!("已发现 {} 个在线用户", self.peers.len()));
+				ui.label(format!("已发现 {} 个在线用户", self.peers.values().filter(|peer| peer.ip != self.local_ip).count()));
 			});
 
 			ui.add_space(8.0);
@@ -550,7 +570,19 @@ impl eframe::App for MyApp {
 							}
 						});
 						ui.horizontal_wrapped(|ui| {
-							for peer in self.peers.values().filter(|peer| peer.bands.contains(&band)) {
+							let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
+							let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 140, 255)));
+							ui.allocate_ui_at_rect(rect, |ui| {
+								frame.show(ui, |ui| {
+									ui.vertical_centered(|ui| {
+										ui.label(format!("{}（本机）", self.local_name));
+										ui.small(format!("ip: {}", self.local_ip));
+										ui.small("在线 | 本机");
+									});
+								});
+							});
+
+							for peer in self.peers.values().filter(|peer| peer.ip != self.local_ip && peer.bands.contains(&band)) {
 								let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
 								let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)));
 								ui.allocate_ui_at_rect(rect, |ui| {
@@ -600,7 +632,7 @@ impl eframe::App for MyApp {
 					if !collapsed {
 						ui.add_space(6.0);
 						ui.horizontal_wrapped(|ui| {
-							for peer in self.peers.values().filter(|p| p.bands.contains(&band)) {
+							for peer in self.peers.values().filter(|p| p.ip != self.local_ip && p.bands.contains(&band)) {
 								let (rect, _resp) = ui.allocate_exact_size(egui::vec2(200.0, 80.0), egui::Sense::hover());
 								let frame = egui::Frame::none().stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200)));
 								ui.allocate_ui_at_rect(rect, |ui| {
@@ -637,18 +669,19 @@ impl Drop for MyApp {
 }
 
 struct AudioService {
-	stop_flag: Arc<AtomicBool>,
+	_stop_flag: Arc<AtomicBool>,
 	input_stream: Option<cpal::Stream>,
-	output_stream: Option<cpal::Stream>,
+	_output_stream: Option<cpal::Stream>,
+	sender_tx: std_mpsc::SyncSender<Vec<u8>>,
 	metrics: Arc<AudioMetrics>,
+	local_ip: String,
 	joined_bands: Arc<Mutex<Vec<u16>>>,
-	status_message: String,
+	_band_mic_enabled: Arc<Mutex<HashMap<u16, bool>>>,
 }
 
 impl AudioService {
-	fn start(
+	fn new(
 		local_ip: String,
-		input_name: Option<String>,
 		output_name: Option<String>,
 		bands: Vec<u16>,
 		band_mic_enabled: Arc<Mutex<HashMap<u16, bool>>>,
@@ -701,15 +734,6 @@ impl AudioService {
 		let host = cpal::default_host();
 		let output_rate = resolve_output_device(&host, output_name.as_deref())
 			.and_then(|device| device.default_output_config().ok().map(|config| config.sample_rate().0));
-
-		let input_stream = resolve_input_device(&host, input_name.as_deref()).and_then(|device| {
-			build_input_stream(
-				&device,
-				snd_tx,
-				Arc::clone(&metrics),
-				local_ip.clone(),
-			)
-		});
 
 		let output_stream = resolve_output_device(&host, output_name.as_deref())
 			.and_then(|device| build_output_stream(&device, Arc::clone(&playback_queue)));
@@ -772,13 +796,37 @@ impl AudioService {
 		});
 
 		Self {
-			stop_flag,
-			input_stream,
-			output_stream,
+			_stop_flag: stop_flag,
+			input_stream: None,
+			_output_stream: output_stream,
+			sender_tx: snd_tx,
 			metrics,
+			local_ip,
 			joined_bands,
-			status_message: "音频服务已启动，正在广播输入设备采集到的声音".to_string(),
+			_band_mic_enabled: band_mic_enabled,
 		}
+	}
+
+	fn start_broadcasting(&mut self, input_name: Option<String>) {
+		if self.input_stream.is_some() {
+			return;
+		}
+
+		let host = cpal::default_host();
+		self.input_stream = input_name.and_then(|name| {
+			resolve_input_device(&host, Some(&name)).and_then(|device| {
+				build_input_stream(
+					&device,
+					self.sender_tx.clone(),
+					Arc::clone(&self.metrics),
+					self.local_ip.clone(),
+				)
+			})
+		});
+	}
+
+	fn stop_broadcasting(&mut self) {
+		let _ = self.input_stream.take();
 	}
 
 	fn set_bands(&self, bands: Vec<u16>) {
@@ -787,10 +835,8 @@ impl AudioService {
 		}
 	}
 
-	fn stop(self) {
-		self.stop_flag.store(false, Ordering::Relaxed);
-		let _ = self.input_stream;
-		let _ = self.output_stream;
+	fn is_broadcasting(&self) -> bool {
+		self.input_stream.is_some()
 	}
 
 	fn mic_level(&self) -> f32 {
@@ -1178,7 +1224,7 @@ impl DiscoveryService {
 				match name_socket.recv_from(&mut name_buffer) {
 					Ok((length, addr)) => {
 							if let Some(packet) = parse_discovery_packet(&name_buffer[..length]) {
-								let peer_ip = addr.ip().to_string();
+								let peer_ip = if packet.ip.is_empty() { addr.ip().to_string() } else { packet.ip };
 								if peer_ip != local_ip {
 									let _ = tx.send(NetEvent::PeerSeen {
 										ip: peer_ip,
@@ -1199,7 +1245,7 @@ impl DiscoveryService {
 				match band_socket.recv_from(&mut band_buffer) {
 					Ok((length, addr)) => {
 						if let Some(packet) = parse_band_discovery_packet(&band_buffer[..length]) {
-							let peer_ip = addr.ip().to_string();
+							let peer_ip = if packet.ip.is_empty() { addr.ip().to_string() } else { packet.ip };
 							if peer_ip != local_ip {
 								let _ = tx.send(NetEvent::BandSeen {
 									ip: peer_ip,
@@ -1272,6 +1318,7 @@ fn parse_discovery_packet(payload: &[u8]) -> Option<DiscoveryPacket> {
 	}
 
 	Some(DiscoveryPacket {
+		ip: parts.next()?.to_string(),
 		name: parts.next()?.to_string(),
 	})
 }
@@ -1297,7 +1344,7 @@ fn parse_band_discovery_packet(payload: &[u8]) -> Option<BandDiscoveryPacket> {
 		return None;
 	}
 
-	let _ip = parts.next()?.to_string();
+	let ip = parts.next()?.to_string();
 	let name = parts.next()?.to_string();
 	let bands = parts
 		.next()?
@@ -1305,7 +1352,7 @@ fn parse_band_discovery_packet(payload: &[u8]) -> Option<BandDiscoveryPacket> {
 		.filter_map(|band| band.trim().parse::<u16>().ok())
 		.collect::<Vec<_>>();
 
-	Some(BandDiscoveryPacket { name, bands })
+	Some(BandDiscoveryPacket { ip, name, bands })
 }
 
 fn sanitize_component(value: &str) -> String {
@@ -1322,11 +1369,22 @@ fn format_age(age: Duration) -> String {
 	}
 }
 
+fn normalize_display_name(value: String) -> Option<String> {
+	let trimmed = value.trim();
+	if trimmed.is_empty() {
+		None
+	} else {
+		Some(trimmed.to_string())
+	}
+}
+
 struct DiscoveryPacket {
+	ip: String,
 	name: String,
 }
 
 struct BandDiscoveryPacket {
+	ip: String,
 	name: String,
 	bands: Vec<u16>,
 }
