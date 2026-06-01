@@ -12,6 +12,11 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+#[cfg(target_os = "windows")]
+use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 const DISCOVERY_PORT: u16 = 42_001;
 const BAND_DISCOVERY_PORT: u16 = 715;
@@ -55,6 +60,7 @@ impl MicGateConfig {
 }
 
 fn main() -> eframe::Result<()> {
+	let autostart_launch = std::env::args().any(|arg| arg == "--autostart");
 	std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
 	std::env::set_var("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe");
 	std::env::remove_var("WAYLAND_DISPLAY");
@@ -72,7 +78,7 @@ fn main() -> eframe::Result<()> {
 		options,
 		Box::new(move |cc| {
 			configure_fonts(&cc.egui_ctx, font_path.as_deref());
-			Box::new(MyApp::new())
+			Box::new(MyApp::new(autostart_launch))
 		}),
 	)
 }
@@ -138,6 +144,11 @@ struct DevicePreferences {
 	user_name: Option<String>,
 	input_device: Option<String>,
 	output_device: Option<String>,
+	mic_gate_config: MicGateConfig,
+	autostart_enabled: bool,
+	autostart_minimize_to_tray: bool,
+	autostart_auto_broadcast: bool,
+	autostart_auto_receive: bool,
 }
 
 fn device_preferences_path() -> std::path::PathBuf {
@@ -167,8 +178,29 @@ fn load_device_preferences() -> DevicePreferences {
 			if !value.trim().is_empty() {
 				preferences.output_device = Some(value.trim().to_string());
 			}
+		} else if let Some(value) = line.strip_prefix("gate_start=") {
+			if let Ok(parsed) = value.trim().parse::<f32>() {
+				preferences.mic_gate_config.start_threshold = parsed;
+			}
+		} else if let Some(value) = line.strip_prefix("gate_stop=") {
+			if let Ok(parsed) = value.trim().parse::<f32>() {
+				preferences.mic_gate_config.stop_threshold = parsed;
+			}
+		} else if let Some(value) = line.strip_prefix("gate_hold=") {
+			if let Ok(parsed) = value.trim().parse::<u32>() {
+				preferences.mic_gate_config.hold_ms = parsed;
+			}
+		} else if let Some(value) = line.strip_prefix("autostart=") {
+			preferences.autostart_enabled = value.trim() == "1";
+		} else if let Some(value) = line.strip_prefix("autostart_minimize_to_tray=") {
+			preferences.autostart_minimize_to_tray = value.trim() == "1";
+		} else if let Some(value) = line.strip_prefix("autostart_auto_broadcast=") {
+			preferences.autostart_auto_broadcast = value.trim() == "1";
+		} else if let Some(value) = line.strip_prefix("autostart_auto_receive=") {
+			preferences.autostart_auto_receive = value.trim() == "1";
 		}
 	}
+	preferences.mic_gate_config = preferences.mic_gate_config.normalized();
 	preferences
 }
 
@@ -176,6 +208,11 @@ fn save_device_preferences(
 	user_name: Option<String>,
 	input_device: Option<String>,
 	output_device: Option<String>,
+	mic_gate_config: MicGateConfig,
+	autostart_enabled: bool,
+	autostart_minimize_to_tray: bool,
+	autostart_auto_broadcast: bool,
+	autostart_auto_receive: bool,
 ) -> std::io::Result<()> {
 	let mut content = String::new();
 	if let Some(name) = user_name {
@@ -187,7 +224,75 @@ fn save_device_preferences(
 	if let Some(name) = output_device {
 		content.push_str(&format!("output={}\n", name));
 	}
+	let mic_gate_config = mic_gate_config.normalized();
+	content.push_str(&format!("gate_start={:.3}\n", mic_gate_config.start_threshold));
+	content.push_str(&format!("gate_stop={:.3}\n", mic_gate_config.stop_threshold));
+	content.push_str(&format!("gate_hold={}\n", mic_gate_config.hold_ms));
+	content.push_str(&format!("autostart={}\n", if autostart_enabled { 1 } else { 0 }));
+	content.push_str(&format!("autostart_minimize_to_tray={}\n", if autostart_minimize_to_tray { 1 } else { 0 }));
+	content.push_str(&format!("autostart_auto_broadcast={}\n", if autostart_auto_broadcast { 1 } else { 0 }));
+	content.push_str(&format!("autostart_auto_receive={}\n", if autostart_auto_receive { 1 } else { 0 }));
 	std::fs::write(device_preferences_path(), content)
+}
+
+#[cfg(target_os = "windows")]
+fn update_windows_autostart(enabled: bool) -> std::io::Result<()> {
+	let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+	let run_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run";
+	if enabled {
+		let (run_key, _) = hkcu.create_subkey(run_key_path)?;
+		let exe = std::env::current_exe()?;
+		let command = format!("\"{}\" --autostart", exe.display());
+		run_key.set_value("saying", &command)?;
+	} else if let Ok(run_key) = hkcu.open_subkey(run_key_path) {
+		let _ = run_key.delete_value("saying");
+	}
+	Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn update_windows_autostart(_enabled: bool) -> std::io::Result<()> {
+	Ok(())
+}
+
+fn make_tray_icon() -> Result<Icon, String> {
+	let width = 32;
+	let height = 32;
+	let mut rgba = vec![0u8; width * height * 4];
+	let center = 16.0f32;
+	for y in 0..height {
+		for x in 0..width {
+			let dx = x as f32 - center;
+			let dy = y as f32 - center;
+			let distance = (dx * dx + dy * dy).sqrt();
+			let offset = (y * width + x) * 4;
+			if distance <= 11.5 {
+				rgba[offset] = 56;
+				rgba[offset + 1] = 185;
+				rgba[offset + 2] = 129;
+				rgba[offset + 3] = 255;
+			} else if distance <= 14.0 {
+				rgba[offset] = 230;
+				rgba[offset + 1] = 236;
+				rgba[offset + 2] = 240;
+				rgba[offset + 3] = 200;
+			}
+		}
+	}
+	Icon::from_rgba(rgba, width as u32, height as u32).map_err(|err| err.to_string())
+}
+
+fn fallback_tray_icon() -> Icon {
+	let width = 32;
+	let height = 32;
+	let mut rgba = vec![0u8; width * height * 4];
+	for pixel in rgba.chunks_exact_mut(4) {
+		pixel[0] = 60;
+		pixel[1] = 179;
+		pixel[2] = 113;
+		pixel[3] = 255;
+	}
+	Icon::from_rgba(rgba, width as u32, height as u32).unwrap()
 }
 
 fn default_input_device_name(host: &cpal::Host) -> Option<String> {
@@ -237,10 +342,18 @@ struct MyApp {
 	audio_service: Option<AudioService>,
 	mic_level: f32,
 	speaker_level: f32,
+	tray_icon: Option<TrayIcon>,
+	tray_exit_item: MenuItem,
+	window_hidden: bool,
+	exit_requested: bool,
+	autostart_enabled: bool,
+	autostart_minimize_to_tray: bool,
+	autostart_auto_broadcast: bool,
+	autostart_auto_receive: bool,
 }
 
 impl MyApp {
-	fn new() -> Self {
+	fn new(autostart_launch: bool) -> Self {
 		let fallback_name = build_local_name();
 		let local_ip = resolve_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
 		let preferences = load_device_preferences();
@@ -251,7 +364,7 @@ impl MyApp {
 		band_mic_defaults.insert(DEFAULT_BAND_PORT, true);
 		let available_collapsed = HashSet::new();
 		let band_mic_enabled = Arc::new(Mutex::new(band_mic_defaults));
-		let mic_gate_config = Arc::new(Mutex::new(MicGateConfig::default()));
+		let mic_gate_config = Arc::new(Mutex::new(preferences.mic_gate_config));
 
 		let host = cpal::default_host();
 		let input_devices: Vec<String> = host
@@ -283,6 +396,23 @@ impl MyApp {
 			default_output_device_name(&host),
 			preferences.output_device.as_deref(),
 		);
+		let autostart_launch = autostart_launch && preferences.autostart_enabled;
+		let window_hidden = autostart_launch && preferences.autostart_minimize_to_tray;
+		let tray_exit_item = MenuItem::new("退出", true, None);
+		let mut audio_service = Some(AudioService::new(
+			local_ip.clone(),
+			preferences.output_device.clone(),
+			joined_bands.clone(),
+			Arc::clone(&band_mic_enabled),
+			mic_gate_config,
+		));
+		if let Some(service) = audio_service.as_mut() {
+			service.set_receive_audio_enabled(!autostart_launch || preferences.autostart_auto_receive);
+			if autostart_launch && preferences.autostart_auto_broadcast {
+				let input_name = input_devices.get(selected_input).cloned();
+				service.start_broadcasting(input_name);
+			}
+		}
 
 		Self {
 			local_name,
@@ -300,15 +430,17 @@ impl MyApp {
 			band_mic_enabled: Arc::clone(&band_mic_enabled),
 			available_collapsed,
 			new_band_text: String::new(),
-			audio_service: Some(AudioService::new(
-				local_ip.clone(),
-				preferences.output_device.clone(),
-				joined_bands.clone(),
-				Arc::clone(&band_mic_enabled),
-				Arc::clone(&mic_gate_config),
-			)),
+			audio_service,
 			mic_level: 0.0,
 			speaker_level: 0.0,
+			tray_icon: None,
+			tray_exit_item,
+			window_hidden,
+			exit_requested: false,
+			autostart_enabled: preferences.autostart_enabled,
+			autostart_minimize_to_tray: preferences.autostart_minimize_to_tray,
+			autostart_auto_broadcast: preferences.autostart_auto_broadcast,
+			autostart_auto_receive: preferences.autostart_auto_receive,
 		}
 	}
 
@@ -443,6 +575,81 @@ impl MyApp {
 			.unwrap_or(true)
 	}
 
+	fn save_preferences(&self) {
+		let gate_config = self
+			.audio_service
+			.as_ref()
+			.map(|service| service.mic_gate_config())
+			.unwrap_or_default();
+		let _ = save_device_preferences(
+			Some(self.local_name.clone()),
+			self.input_devices.get(self.selected_input).cloned(),
+			self.output_devices.get(self.selected_output).cloned(),
+			gate_config,
+			self.autostart_enabled,
+			self.autostart_minimize_to_tray,
+			self.autostart_auto_broadcast,
+			self.autostart_auto_receive,
+		);
+	}
+
+	fn apply_autostart_registry(&self) {
+		let _ = update_windows_autostart(self.autostart_enabled);
+	}
+
+	fn ensure_tray_icon(&mut self) {
+		if self.tray_icon.is_some() {
+			return;
+		}
+
+		let icon = make_tray_icon().unwrap_or_else(|_| fallback_tray_icon());
+		let menu = Menu::new();
+		let _ = menu.append_items(&[
+			&PredefinedMenuItem::separator(),
+			&self.tray_exit_item,
+		]);
+		let tray_icon = TrayIconBuilder::new()
+			.with_menu(Box::new(menu))
+			.with_menu_on_left_click(false)
+			.with_menu_on_right_click(true)
+			.with_tooltip("saying 局域网语音聊天")
+			.with_icon(icon)
+			.build()
+			.ok();
+		self.tray_icon = tray_icon;
+	}
+
+	fn set_window_visible(&mut self, ctx: &egui::Context, visible: bool) {
+		self.window_hidden = !visible;
+		ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+	}
+
+	fn handle_tray_events(&mut self, ctx: &egui::Context) {
+		while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+			match event {
+				TrayIconEvent::Click {
+					button: MouseButton::Left,
+					..
+				} => {
+					let next_visible = self.window_hidden;
+					self.set_window_visible(ctx, next_visible);
+				}
+				TrayIconEvent::DoubleClick { .. } => {
+					let next_visible = self.window_hidden;
+					self.set_window_visible(ctx, next_visible);
+				}
+				_ => {}
+			}
+		}
+
+		while let Ok(event) = MenuEvent::receiver().try_recv() {
+			if event.id == self.tray_exit_item.id() {
+				self.exit_requested = true;
+				ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+			}
+		}
+	}
+
 	fn local_is_speaking_on_band(&self, band: u16) -> bool {
 		self.audio_service
 			.as_ref()
@@ -455,6 +662,19 @@ impl MyApp {
 
 impl eframe::App for MyApp {
 	fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+		self.ensure_tray_icon();
+		self.handle_tray_events(ctx);
+		if ctx.input(|input| input.viewport().close_requested()) {
+			if self.exit_requested {
+				return;
+			}
+			ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+			self.set_window_visible(ctx, false);
+		}
+		if self.window_hidden {
+			ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+		}
+
 		self.ingest_network_events();
 
 		egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -465,15 +685,40 @@ impl eframe::App for MyApp {
 					let response = ui.text_edit_singleline(&mut self.local_name);
 					if response.changed() {
 						self.discovery.set_local_name(self.local_name.clone());
-						let _ = save_device_preferences(
-							Some(self.local_name.clone()),
-							self.input_devices.get(self.selected_input).cloned(),
-							self.output_devices.get(self.selected_output).cloned(),
-						);
+						self.save_preferences();
 					}
 				});
 				ui.label(format!("本机 IP: {}", self.local_ip));
 				ui.label(&self.status);
+				ui.separator();
+				ui.horizontal_wrapped(|ui| {
+					let mut autostart_changed = false;
+					autostart_changed |= ui
+						.checkbox(&mut self.autostart_enabled, "是否开机自启动")
+						.changed();
+					if ui
+						.checkbox(&mut self.autostart_minimize_to_tray, "自启动时最小化到系统托盘")
+						.changed()
+					{
+						self.save_preferences();
+					}
+					if ui
+						.checkbox(&mut self.autostart_auto_broadcast, "自启动时自动开始广播")
+						.changed()
+					{
+						self.save_preferences();
+					}
+					if ui
+						.checkbox(&mut self.autostart_auto_receive, "自启动时自动开始接收声音")
+						.changed()
+					{
+						self.save_preferences();
+					}
+					if autostart_changed {
+						self.apply_autostart_registry();
+						self.save_preferences();
+					}
+				});
 			});
 		});
 
@@ -529,11 +774,7 @@ impl eframe::App for MyApp {
 						});
 
 					if device_selection_changed {
-						let _ = save_device_preferences(
-							Some(self.local_name.clone()),
-							self.input_devices.get(self.selected_input).cloned(),
-							self.output_devices.get(self.selected_output).cloned(),
-						);
+						self.save_preferences();
 					}
 
 					let broadcasting = self
@@ -550,6 +791,26 @@ impl eframe::App for MyApp {
 							let input_name = self.input_devices.get(self.selected_input).cloned();
 							service.start_broadcasting(input_name);
 							self.status = "音频广播已开始，接收保持开启".to_string();
+						}
+					}
+
+					let receive_audio_enabled = self
+						.audio_service
+						.as_ref()
+						.map(|service| service.is_receive_audio_enabled())
+						.unwrap_or(true);
+					if ui
+						.button(if receive_audio_enabled { "停止接收所有频道声音" } else { "恢复接收所有频道声音" })
+						.clicked()
+					{
+						if let Some(service) = self.audio_service.as_mut() {
+							let next = !receive_audio_enabled;
+							service.set_receive_audio_enabled(next);
+							self.status = if next {
+								"已恢复接收所有频道声音".to_string()
+							} else {
+								"已停止接收所有频道声音".to_string()
+							};
 						}
 					}
 
@@ -582,22 +843,24 @@ impl eframe::App for MyApp {
 							self.status = "音频广播已停止，接收仍保持开启".to_string();
 						}
 					}
+				});
 
-					ui.add_space(8.0);
-					ui.separator();
+				ui.add_space(8.0);
+				ui.separator();
+				ui.horizontal_wrapped(|ui| {
 					ui.label("麦克风门限");
 					if let Some(service) = self.audio_service.as_ref() {
 						let mut gate_config = service.mic_gate_config();
 						let mut changed = false;
 						changed |= ui
 							.add(
-								egui::Slider::new(&mut gate_config.start_threshold, 0.05..=0.30)
+								egui::Slider::new(&mut gate_config.start_threshold, 0.0..=0.30)
 									.text("起播阈值")
 							)
 							.changed();
 						changed |= ui
 							.add(
-								egui::Slider::new(&mut gate_config.stop_threshold, 0.01..=0.25)
+								egui::Slider::new(&mut gate_config.stop_threshold, 0.0..=0.25)
 									.text("停播阈值")
 							)
 							.changed();
@@ -610,6 +873,7 @@ impl eframe::App for MyApp {
 						gate_config = gate_config.normalized();
 						if changed {
 							service.set_mic_gate_config(gate_config);
+							self.save_preferences();
 						}
 						ui.small(format!(
 							"当前: 起播 {:.2}, 停播 {:.2}, 保持 {}ms",
@@ -678,7 +942,7 @@ impl eframe::App for MyApp {
 								;
 
 							// fixed-size local card
-							let size = egui::vec2(100.0, 45.0);
+							let size = egui::vec2(100.0, 60.0);
 							let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
 							let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center));
 							frame.show(&mut child, |ui| {
@@ -688,6 +952,12 @@ impl eframe::App for MyApp {
 										ui.label(format!("{}（本机）", self.local_name));
 									});
 									ui.small(format!("ip: {}", self.local_ip));
+									let age = self
+										.audio_service
+										.as_ref()
+										.and_then(|service| service.local_voice_age())
+										.unwrap_or_else(|| Duration::from_secs(0));
+									ui.small(format!("{} 前", format_age(age)));
 								});
 							});
 
@@ -703,7 +973,7 @@ impl eframe::App for MyApp {
 									;
 
 								// fixed-size peer card
-								let size = egui::vec2(100.0, 45.0);
+								let size = egui::vec2(100.0, 60.0);
 								let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
 								let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center));
 								frame.show(&mut child, |ui| {
@@ -808,6 +1078,8 @@ struct AudioService {
 	playback_queue: Arc<Mutex<VecDeque<i16>>>,
 	output_rate: Option<u32>,
 	loopback_enabled: Arc<AtomicBool>,
+	receive_audio_enabled: Arc<AtomicBool>,
+	local_voice_last_seen: Arc<Mutex<Instant>>,
 	mic_gate_config: Arc<Mutex<MicGateConfig>>,
 	_band_mic_enabled: Arc<Mutex<HashMap<u16, bool>>>,
 }
@@ -824,6 +1096,8 @@ impl AudioService {
 		let metrics = Arc::new(AudioMetrics::default());
 		let playback_queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
 		let loopback_enabled = Arc::new(AtomicBool::new(false));
+		let receive_audio_enabled = Arc::new(AtomicBool::new(true));
+		let local_voice_last_seen = Arc::new(Mutex::new(Instant::now()));
 		let (snd_tx, snd_rx) = std_mpsc::sync_channel::<Vec<u8>>(64);
 		let joined_bands = Arc::new(Mutex::new(bands));
 		let bands_for_send = Arc::clone(&joined_bands);
@@ -880,6 +1154,7 @@ impl AudioService {
 		let receiver_stop = Arc::clone(&stop_flag);
 		let receiver_queue = Arc::clone(&playback_queue);
 		let receiver_metrics = Arc::clone(&metrics);
+		let receiver_enabled = Arc::clone(&receive_audio_enabled);
 		let bands_for_recv = Arc::clone(&joined_bands);
 		let speaking_map_for_recv = Arc::clone(&speaking_map);
 		thread::spawn(move || {
@@ -903,6 +1178,9 @@ impl AudioService {
 					let band = current_bands.get(i).cloned().unwrap_or(DEFAULT_BAND_PORT);
 					match socket.recv_from(&mut buffer) {
 						Ok((length, addr)) => {
+							if !receiver_enabled.load(Ordering::Relaxed) {
+								continue;
+							}
 							if addr.ip().to_string() == local_ip_for_recv {
 								continue;
 							}
@@ -951,6 +1229,8 @@ impl AudioService {
 			playback_queue,
 			output_rate,
 			loopback_enabled,
+				receive_audio_enabled,
+				local_voice_last_seen,
 			mic_gate_config,
 			_band_mic_enabled: band_mic_enabled,
 		}
@@ -973,6 +1253,7 @@ impl AudioService {
 					self.output_rate,
 					Arc::clone(&self.playback_queue),
 					Arc::clone(&self.mic_gate_config),
+					Arc::clone(&self.local_voice_last_seen),
 				)
 			})
 		});
@@ -1006,6 +1287,24 @@ impl AudioService {
 
 	fn is_loopback_enabled(&self) -> bool {
 		self.loopback_enabled.load(Ordering::Relaxed)
+	}
+
+	fn set_receive_audio_enabled(&self, enabled: bool) {
+		self.receive_audio_enabled.store(enabled, Ordering::Relaxed);
+		if !enabled {
+			if let Ok(mut queue) = self.playback_queue.lock() {
+				queue.clear();
+			}
+			self.metrics.set_speaker_level(0.0);
+		}
+	}
+
+	fn is_receive_audio_enabled(&self) -> bool {
+		self.receive_audio_enabled.load(Ordering::Relaxed)
+	}
+
+	fn local_voice_age(&self) -> Option<Duration> {
+		self.local_voice_last_seen.lock().ok().map(|instant| instant.elapsed())
 	}
 
 	fn mic_gate_config(&self) -> MicGateConfig {
@@ -1105,13 +1404,14 @@ fn build_input_stream(
 	output_rate: Option<u32>,
 	playback_queue: Arc<Mutex<VecDeque<i16>>>,
 	mic_gate_config: Arc<Mutex<MicGateConfig>>,
+	local_voice_last_seen: Arc<Mutex<Instant>>,
 ) -> Option<cpal::Stream> {
 	let config = device.default_input_config().ok()?;
 	let sample_rate = config.sample_rate().0;
 	let channels = config.channels() as usize;
 	let err_fn = |error| eprintln!("input stream error: {error}");
 	let broadcast_active = Arc::new(AtomicBool::new(false));
-	let last_voice = Arc::new(Mutex::new(Instant::now()));
+	let last_voice = Arc::clone(&local_voice_last_seen);
 
 	let stream = match config.sample_format() {
 		SampleFormat::F32 => device.build_input_stream(
